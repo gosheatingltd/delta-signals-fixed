@@ -71,15 +71,26 @@ async def fetch_symbol(session, sym: str):
     scfg = ScalperConfig(min_minutes_between_signals=int(min_gap), max_signals_per_day=int(max_day))
     sigs = combine_signals_5m(feats, scfg)
 
+    # Price cross-verify
+gecko_px = None
+try:
+    cg = await coingecko_price(session, gecko_map[sym])
+    # cg is expected to be {id: float}; but be defensive:
+    if isinstance(cg, dict) and len(cg):
+        val = next(iter(cg.values()))
+        if isinstance(val, dict):  # old shape like {"usd": 123}
+            gecko_px = float(val.get("usd")) if val.get("usd") is not None else None
+        else:
+            gecko_px = float(val)
+except Exception:
     gecko_px = None
-    try:
-        cg = await coingecko_price(session, gecko_map[sym])
-        gecko_px = list(cg.values())[0]
-    except Exception:
-        pass
 
-    last_close = float(feats["close"].iloc[-1])
-    diff_bps = (abs(last_close - gecko_px) / ((last_close + gecko_px) / 2) * 10000) if gecko_px is not None else None
+last_close = float(feats["close"].iloc[-1])
+diff_bps = (
+    abs(last_close - gecko_px) / ((last_close + gecko_px) / 2) * 10000
+    if gecko_px is not None else None
+)
+
 
     last_sig = int(sigs.iloc[-1]) if len(sigs) else 0
     direction = "LONG" if last_sig > 0 else ("SHORT" if last_sig < 0 else "FLAT")
