@@ -264,34 +264,38 @@ for i, (latest, feats, hist_filt, hist_raw) in enumerate(results):
             plot_df = plot_df.rename(columns={"ts": "time"})
 
             # Build arrow points from filtered history (SAFE MERGE on UK minute key)
-            sigs_for_plot = hist_filt.copy()
-            if not sigs_for_plot.empty:
-                # hist_filt["time"] is UK formatted strings like "YYYY-MM-DD HH:MM"
-                sigs_for_plot["time_key"] = sigs_for_plot["time"].astype(str)
+sigs_for_plot = hist_filt.copy()
+if not sigs_for_plot.empty:
+    # hist_filt["time"] is already UK strings like "YYYY-MM-DD HH:MM"
+    sigs_for_plot["time_key"] = sigs_for_plot["time"].astype(str)
 
-                # Create a matching key from plot_df times → UK strings at minute resolution
-                plot_df["time_key"] = (
-                    pd.to_datetime(plot_df["time"])               # ensure datetime
-                    .dt.tz_localize("UTC", nonexistent="NaT", ambiguous="NaT")
-                    .dt.tz_convert("Europe/London")
-                    .dt.strftime("%Y-%m-%d %H:%M")
-                )
+    # Create a matching key from plot_df times → UK strings at minute resolution
+    ts = pd.to_datetime(plot_df["time"], errors="coerce")
 
-                # Merge on the uniform string key
-                join_df = plot_df[["time", "close", "time_key"]].merge(
-                    sigs_for_plot[["time_key", "signal"]],
-                    on="time_key",
-                    how="inner",
-                    validate="m:1"
-                )
+    # Only localize if timestamps are tz-naive; otherwise just convert
+    if getattr(ts.dt, "tz", None) is None:
+        ts = ts.dt.tz_localize("UTC", nonexistent="NaT", ambiguous="NaT")
 
-                # Place arrows slightly above/below price
-                join_df["arrow_y"] = join_df.apply(
-                    lambda r: r["close"] * (1.005 if r["signal"] == "LONG" else 0.995),
-                    axis=1
-                )
-            else:
-                join_df = pd.DataFrame(columns=["time", "close", "signal", "arrow_y"])
+    plot_df["time_key"] = (
+        ts.dt.tz_convert("Europe/London")
+          .dt.strftime("%Y-%m-%d %H:%M")
+    )
+
+    # Merge on the uniform string key
+    join_df = plot_df[["time", "close", "time_key"]].merge(
+        sigs_for_plot[["time_key", "signal"]],
+        on="time_key",
+        how="inner",
+        validate="m:1"
+    )
+
+    # Place arrows slightly above/below price
+    join_df["arrow_y"] = join_df.apply(
+        lambda r: r["close"] * (1.005 if r["signal"] == "LONG" else 0.995),
+        axis=1
+    )
+else:
+    join_df = pd.DataFrame(columns=["time", "close", "signal", "arrow_y"])
 
             # Long-form for EMAs/Close
             long_df = plot_df.melt("time", var_name="series", value_name="value")
