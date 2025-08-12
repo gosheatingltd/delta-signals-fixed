@@ -10,7 +10,7 @@ if os.path.isdir(SRC_DIR) and SRC_DIR not in sys.path:
 
 import asyncio
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 import pandas as pd
 import streamlit as st
 import pytz
@@ -26,7 +26,7 @@ UK_TZ = pytz.timezone("Europe/London")
 
 st.set_page_config(page_title="⚡ Crypto Edge — 5-Min Signals (ETH & BTC)", layout="wide")
 st.title("⚡ Crypto Edge — 5-Minute Signals (ETH & BTC)")
-st.caption("Public data only • Cross-verified prices • 5m timeframe • 12-hour clock • Filtered + Raw")
+st.caption("Public data only • Cross-verified prices • 5m timeframe • 12-hour clock • Filtered + Raw + Nowcast")
 
 # ==============================
 # CONFIG
@@ -125,6 +125,8 @@ def _empty_symbol(sym: str):
         "symbol": sym,
         "signal_filtered": "FLAT",
         "signal_raw": "FLAT",
+        "likely_next_filtered": "—",
+        "likely_next_raw": "—",
         "price_binance": None,
         "price_coingecko": None,
         "price_diff_bps": None,
@@ -195,9 +197,8 @@ async def _binance_futures_any(session, symbol, interval, days):
     return pd.DataFrame(), None
 
 async def _cryptocompare_1m(session, fsym: str, tsym: str, minutes: int = 1440):
-    # Public endpoint: https://min-api.cryptocompare.com/data/v2/histominute
-    limit = max(2, min(2000, minutes))  # CC cap
     url = "https://min-api.cryptocompare.com/data/v2/histominute"
+    limit = max(2, min(2000, minutes))
     params = {"fsym": fsym, "tsym": tsym, "limit": limit}
     data, status = await _http_json(session, url, params)
     if not data or "Data" not in data or "Data" not in data["Data"]:
@@ -206,42 +207,28 @@ async def _cryptocompare_1m(session, fsym: str, tsym: str, minutes: int = 1440):
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
-    # df columns: time, high, low, open, close, volumefrom, volumeto
     df["open_time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-    df["volume"] = pd.to_numeric(df.get("volumefrom", 0.0), errors="coerce")  # base volume
+    df["volume"] = pd.to_numeric(df.get("volumefrom", 0.0), errors="coerce")
     for c in ["open","high","low","close"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df[["open_time","open","high","low","close","volume"]].dropna()
-    return df
+    return df[["open_time","open","high","low","close","volume"]].dropna()
 
 def _resample_1m_to_5m(df_1m: pd.DataFrame) -> pd.DataFrame:
     if df_1m.empty:
         return df_1m
     tmp = df_1m.copy()
     tmp = tmp.set_index(pd.to_datetime(tmp["open_time"], utc=True))
-    agg = {
-        "open": "first",
-        "high": "max",
-        "low": "min",
-        "close": "last",
-        "volume": "sum",
-    }
+    agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
     out = tmp.resample("5T").agg(agg).dropna().reset_index().rename(columns={"index":"open_time"})
     return out[["open_time","open","high","low","close","volume"]]
 
 def _sym_to_cc(symbol: str):
-    # ETHUSDT -> fsym=ETH, tsym=USDT   | BTCUSDT -> BTC/USDT
     if symbol.endswith("USDT"):
         return symbol[:-4], "USDT"
     return symbol, "USD"
 
 async def get_klines_safe(session: aiohttp.ClientSession, symbol: str, interval: str, days: int):
-    """
-    project -> Binance Futures (multi-host) -> CryptoCompare 1m (resample to 5m)
-    Returns (df, source_name).
-    """
     days_try = max(1, min(days, 7))
-
     # 1) Project source
     try:
         df = await get_klines(session, symbol, interval=interval, days=days_try)
@@ -249,37 +236,60 @@ async def get_klines_safe(session: aiohttp.ClientSession, symbol: str, interval:
             return df, "project"
     except Exception:
         pass
-
     # 2) Binance Futures (multi-host)
     df_fut, host_fut = await _binance_futures_any(session, symbol, interval, days_try)
     if not df_fut.empty:
         return df_fut, f"binance_futures ({host_fut})"
-
-    # 3) CryptoCompare 1m fallback -> resample to 5m
+    # 3) CryptoCompare 1m → 5m
     fsym, tsym = _sym_to_cc(symbol)
-    minutes_needed = min(2000, days_try * 24 * 60)  # cap at API limit
+    minutes_needed = min(2000, days_try * 24 * 60)
     df_cc = await _cryptocompare_1m(session, fsym, tsym, minutes=minutes_needed)
     if not df_cc.empty:
         if interval == "5m":
             df_cc = _resample_1m_to_5m(df_cc)
         return df_cc, "cryptocompare_1m->5m"
-
-    # 4) Last resort: tiny CC pull
+    # last-resort tiny pull
     df_cc = await _cryptocompare_1m(session, fsym, tsym, minutes=360)
     if not df_cc.empty:
         if interval == "5m":
             df_cc = _resample_1m_to_5m(df_cc)
         return df_cc, "cryptocompare_1m->5m_small"
-
     return pd.DataFrame(), "none"
 
 # ==============================
-# Per-symbol pipeline (Raw + Filters)
+# Live price (for nowcast) — Binance Futures
+# ==============================
+async def get_live_price_futures(session: aiohttp.ClientSession, symbol: str) -> float | None:
+    url = "https://fapi.binance.com/fapi/v1/ticker/price"
+    params = {"symbol": symbol}
+    data, status = await _http_json(session, url, params)
+    try:
+        if data and "price" in data:
+            return float(data["price"])
+    except Exception:
+        pass
+    return None
+
+# Compute indicators for appended synthetic bar
+def compute_indicators_for_series(close_series: pd.Series) -> pd.DataFrame:
+    df = pd.DataFrame({"close": close_series})
+    df["ema_fast"] = df["close"].ewm(span=9, adjust=False).mean()
+    df["ema_slow"] = df["close"].ewm(span=21, adjust=False).mean()
+    # RSI14
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+    rs = gain / loss.replace(0, 1e-12)
+    df["rsi14"] = 100 - (100 / (1 + rs))
+    return df
+
+# ==============================
+# Per-symbol pipeline (Raw + Filters + Nowcast)
 # ==============================
 async def fetch_symbol(session, sym: str):
     gecko_map = {"BTCUSDT": ["bitcoin"], "ETHUSDT": ["ethereum"]}
 
-    # 1) OHLC (safe fetch with source label)
+    # 1) OHLC (safe fetch)
     ohlc, source_name = await get_klines_safe(session, sym,
                                               interval=cfg["intraday"]["interval"],
                                               days=int(cfg["intraday"]["lookback_days"]))
@@ -289,7 +299,7 @@ async def fetch_symbol(session, sym: str):
         latest["source"] = "none"
         return latest, empty_feats, empty_hist, empty_hist2
 
-    # 2) Features
+    # 2) Features (closed bars)
     feats = build_features_5m(ohlc)
     if feats is None or feats.empty:
         st.warning(f"{sym}: insufficient data for features (5m).")
@@ -297,7 +307,7 @@ async def fetch_symbol(session, sym: str):
         latest["source"] = source_name
         return latest, empty_feats, empty_hist, empty_hist2
 
-    # Ensure index UK tz-aware for display
+    # Ensure index UK tz-aware
     try:
         if getattr(feats.index, "tz", None) is None and getattr(feats.index, "tzinfo", None) is None:
             feats.index = feats.index.tz_localize("UTC")
@@ -310,11 +320,11 @@ async def fetch_symbol(session, sym: str):
     except Exception:
         feats.index = pd.to_datetime(feats.index).tz_localize(UK_TZ)
 
-    # 3) Signals (raw) + throttling
+    # 3) Signals (raw) + throttling on CLOSED bars
     scfg = ScalperConfig(min_minutes_between_signals=int(min_gap), max_signals_per_day=int(max_day))
     sigs_raw = combine_signals_5m(feats, scfg)  # -1/0/+1
 
-    # 4) Filters (Volume + Trend)
+    # 4) Filters (Volume + Trend) on CLOSED bars
     feats["ema50"] = feats["close"].ewm(span=50, adjust=False).mean()
     feats["ema200"] = feats["close"].ewm(span=200, adjust=False).mean()
     if "volume" not in feats.columns and "volume" in ohlc.columns:
@@ -331,13 +341,59 @@ async def fetch_symbol(session, sym: str):
     sigs_filt[(sigs_raw > 0) & ~(vol_ok_series & uptrend_series)] = 0
     sigs_filt[(sigs_raw < 0) & ~(vol_ok_series & downtrend_series)] = 0
 
-    # 5) Provisional previews (forming candle)
+    # 5) Provisional previews (last closed bar stance)
     prov_raw_val = int(sigs_raw.iloc[-1]) if len(sigs_raw) else 0
     prov_filt_val = int(sigs_filt.iloc[-1]) if len(sigs_filt) else 0
     provisional_raw = "LONG" if prov_raw_val > 0 else ("SHORT" if prov_raw_val < 0 else "FLAT")
     provisional_filt = "LONG" if prov_filt_val > 0 else ("SHORT" if prov_filt_val < 0 else "FLAT")
 
-    # 6) Cross-verify price
+    # 6) Live price nowcast: simulate next 5m bar with live futures price
+    live_px = await get_live_price_futures(session, sym)
+    likely_next_raw = "—"
+    likely_next_filt = "—"
+    if live_px is not None and not feats.empty:
+        try:
+            # Build a synthetic next timestamp (next 5-min boundary in UK time)
+            last_ts = feats.index[-1]  # last CLOSED bar end time (tz-aware UK)
+            # We'll append a NEXT bar at last_ts + 5 minutes
+            synth_ts = last_ts + pd.Timedelta(minutes=5)
+
+            # Recompute indicators with appended close
+            close_series = pd.concat([feats["close"], pd.Series([live_px], index=[synth_ts])])
+            ind = compute_indicators_for_series(close_series)
+            # Trend on appended bar
+            ema50 = close_series.ewm(span=50, adjust=False).mean().iloc[-1]
+            ema200 = close_series.ewm(span=200, adjust=False).mean().iloc[-1]
+            trend_ok_long = ema50 > ema200
+            trend_ok_short = ema50 < ema200
+
+            # Build a tiny features-like df for combine_signals_5m
+            now_feats = pd.DataFrame({
+                "close": ind["close"],
+                "ema_fast": ind["ema_fast"],
+                "ema_slow": ind["ema_slow"],
+                "rsi14": ind["rsi14"],
+            })
+            now_feats.index = close_series.index
+
+            # Run your signal combiner on this augmented set
+            now_sigs = combine_signals_5m(now_feats, scfg)
+            now_sig_val = int(now_sigs.iloc[-1]) if len(now_sigs) else 0
+            likely_next_raw = "LONG" if now_sig_val > 0 else ("SHORT" if now_sig_val < 0 else "FLAT")
+
+            # Apply trend filter (volume unknown mid-bar -> treat as "est.")
+            if now_sig_val > 0 and trend_ok_long:
+                likely_next_filt = "LONG (est.)"
+            elif now_sig_val < 0 and trend_ok_short:
+                likely_next_filt = "SHORT (est.)"
+            else:
+                likely_next_filt = "FLAT (est.)"
+        except Exception:
+            likely_next_raw = "—"
+            likely_next_filt = "—"
+
+    # 7) Cross-verify price
+    gecko_map = {"BTCUSDT": ["bitcoin"], "ETHUSDT": ["ethereum"]}
     gecko_px = None
     try:
         cg = await coingecko_price(session, gecko_map[sym])
@@ -350,7 +406,7 @@ async def fetch_symbol(session, sym: str):
     last_close = float(feats["close"].iloc[-1])
     diff_bps = (abs(last_close - gecko_px) / ((last_close + gecko_px) / 2) * 10000) if gecko_px is not None else None
 
-    # 7) Latest snapshots
+    # 8) Latest snapshots (closed-bar official)
     idx_filt, val_filt = latest_nonzero(sigs_filt)
     idx_raw,  val_raw  = latest_nonzero(sigs_raw)
 
@@ -358,6 +414,8 @@ async def fetch_symbol(session, sym: str):
         "symbol": sym,
         "signal_filtered": "FLAT" if idx_filt is None else ("LONG" if val_filt > 0 else "SHORT"),
         "signal_raw":      "FLAT" if idx_raw  is None else ("LONG" if val_raw  > 0 else "SHORT"),
+        "likely_next_filtered": likely_next_filt,
+        "likely_next_raw": likely_next_raw,
         "price_binance": round(last_close, 2),
         "price_coingecko": None if gecko_px is None else round(float(gecko_px), 2),
         "price_diff_bps": None if diff_bps is None else round(float(diff_bps), 1),
@@ -373,7 +431,7 @@ async def fetch_symbol(session, sym: str):
         "source": source_name
     }
 
-    # 8) Histories (UK, 12-hour)
+    # 9) Histories (UK, 12-hour)
     nz_filt = sigs_filt[sigs_filt != 0].tail(30)
     hist_filt = pd.DataFrame({
         "time": [fmt12_no_tz(t) for t in nz_filt.index],
@@ -403,7 +461,7 @@ next_time, tminus = countdown_to_next_bar()
 st.info(f"🕒 Current UK time: **{now_uk_floor().strftime('%I:%M %p %Z')}**  |  Next 5-min bar: **{next_time}** (T–{tminus})")
 
 # ==============================
-# Summary
+# Summary (official + nowcast)
 # ==============================
 rows = []
 for (latest, feats, hist_filt, hist_raw) in results:
@@ -411,9 +469,9 @@ for (latest, feats, hist_filt, hist_raw) in results:
         "symbol": latest["symbol"],
         "data_source": latest.get("source", "unknown"),
         "trade_now (filtered)": latest["signal_filtered"],
-        "provisional (filtered)": latest["provisional_filtered"] if show_provisional else "—",
+        "likely_next (filtered)": latest["likely_next_filtered"],
         "trade_now (raw)": latest["signal_raw"],
-        "provisional (raw)": latest["provisional_raw"] if show_provisional else "—",
+        "likely_next (raw)": latest["likely_next_raw"],
         "trend": latest["trend"],
         "volume_ok": latest["volume_ok"],
         "last_bar (UK)": latest["last_bar"],
@@ -426,7 +484,7 @@ for (latest, feats, hist_filt, hist_raw) in results:
         "ema9-21": latest["ema9_minus_21"],
     })
 
-st.subheader("🚦 Trade Now (by symbol)")
+st.subheader("🚦 Trade Now + Likely Next")
 st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
 # ==============================
@@ -436,7 +494,7 @@ left, right = st.columns(2)
 for i, (latest, feats, hist_filt, hist_raw) in enumerate(results):
     with (left if i % 2 == 0 else right):
         st.markdown(f"### {latest['symbol']} — Filtered: **{latest['signal_filtered']}** • Raw: **{latest['signal_raw']}**")
-        st.caption(f"Data source: {latest.get('source','unknown')} • Trend: {latest['trend']} • Volume OK: {latest['volume_ok']} • Last bar: {latest['last_bar']}")
+        st.caption(f"Likely next (raw/filtered): {latest['likely_next_raw']} / {latest['likely_next_filtered']}  •  Data source: {latest.get('source','unknown')}  •  Trend: {latest['trend']}  •  Last bar: {latest['last_bar']}")
 
         # ---- PRICE CHART: Close + EMA9 + EMA21 (Altair) ----
         if not feats.empty:
