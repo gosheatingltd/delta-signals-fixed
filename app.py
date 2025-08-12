@@ -1,5 +1,3 @@
-import altair as alt
-
 # --- Path setup so imports work on Streamlit Cloud ---
 import os, sys
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -15,6 +13,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 import pytz
+import altair as alt
 
 from src.utils import load_yaml
 from src.data_sources import get_klines, coingecko_price
@@ -100,7 +99,6 @@ def _empty_symbol(sym: str):
 
 def to_london(ts):
     uk = pytz.timezone("Europe/London")
-    # ts from features index is usually UTC-aware
     if getattr(ts, "tzinfo", None) is None:
         ts = pytz.utc.localize(ts)
     return ts.astimezone(uk)
@@ -202,9 +200,44 @@ left, right = st.columns(2)
 for i, (latest, feats, hist) in enumerate(results):
     with (left if i % 2 == 0 else right):
         st.markdown(f"### {latest['symbol']}")
+
+        # ---- PRICE CHART: Close + EMA9 + EMA21 (Altair) ----
         if not feats.empty:
-            st.line_chart(feats[["close", "ema_fast", "ema_slow"]])
+            plot_df = feats[["close", "ema_fast", "ema_slow"]].copy().reset_index()
+            plot_df = plot_df.rename(columns={"ts": "time"})
+            long_df = plot_df.melt("time", var_name="series", value_name="value")
+            name_map = {"close": "Close", "ema_fast": "EMA 9", "ema_slow": "EMA 21"}
+            long_df["series"] = long_df["series"].map(name_map)
+
+            line = (
+                alt.Chart(long_df)
+                .mark_line()
+                .encode(
+                    x=alt.X("time:T", title="Time (UK)"),
+                    y=alt.Y("value:Q", title="Price (USD)"),
+                    color=alt.Color(
+                        "series:N",
+                        title="Legend",
+                        scale=alt.Scale(
+                            domain=["Close", "EMA 9", "EMA 21"],
+                            range=["#1f77b4", "#e45756", "#4ea8de"],  # dark blue, red, light blue
+                        ),
+                    ),
+                    tooltip=[
+                        alt.Tooltip("time:T", title="Time"),
+                        alt.Tooltip("series:N", title="Series"),
+                        alt.Tooltip("value:Q", title="Value", format=",.2f"),
+                    ],
+                )
+                .properties(height=260)
+                .interactive()
+            )
+            st.altair_chart(line, use_container_width=True)
+
+            # RSI bar chart
             st.bar_chart(feats[["rsi14"]])
+
+        # Recent signals table
         if not hist.empty:
             st.markdown("**Recent non-zero signals**")
             st.dataframe(hist, use_container_width=True, height=240)
