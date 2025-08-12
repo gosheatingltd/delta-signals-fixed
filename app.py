@@ -1,3 +1,5 @@
+import altair as alt
+
 # --- Path setup so imports work on Streamlit Cloud ---
 import os, sys
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
