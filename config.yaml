@@ -1,6 +1,3 @@
-intraday:
-  interval: "5m"
-  lookback_days: 2
 
 
 symbols:
