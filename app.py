@@ -31,7 +31,7 @@ UK_TZ = pytz.timezone("Europe/London")
 
 st.set_page_config(page_title="⚡ Crypto Edge — 5-Minute Signals", layout="wide")
 st.title("⚡ Crypto Edge — 5-Minute Signals (BTC & ETC)")
-st.caption("Public data only • Cross-verified prices • Filters: Volume + Trend • 5m timeframe • UK time")
+st.caption("Public data only • Cross-verified prices • 5m timeframe • UK time • Raw + Filtered views")
 
 # ==============================
 # CONFIG (short cache)
@@ -73,25 +73,31 @@ with colB:
 with colC:
     max_day = st.number_input("Max signals/day", 5, 50, max_day, 1)
 
-# Auto-refresh (if package available) + manual force-refresh
+# Auto-refresh (optional) + manual Force refresh
 if st_autorefresh:
     st_autorefresh(interval=int(poll) * 1000, key="auto")
 else:
-    st.info("Auto-refresh package not installed. Add 'streamlit-autorefresh>=1.0.1' to requirements.txt to enable it.")
+    st.info("Auto-refresh not installed. Add 'streamlit-autorefresh>=1.0.1' to requirements.txt to enable it.")
 if st.button("Force refresh data now"):
     st.cache_data.clear()
     st.experimental_rerun()
 
-show_raw = st.checkbox("Show raw (unfiltered) signal history", value=False)
+show_raw_table = st.checkbox("Show raw (unfiltered) signal tables under each chart", value=True)
 
 # ==============================
-# Helpers
+# Helpers (UK time fix)
 # ==============================
 def to_london(ts):
-    """Convert a timestamp to Europe/London (keeps tz-aware)."""
-    if getattr(ts, "tzinfo", None) is None:
-        ts = pytz.utc.localize(ts)
-    return ts.astimezone(UK_TZ)
+    """Convert a timestamp (pd.Timestamp or datetime) to Europe/London correctly."""
+    # If it's a pandas Timestamp
+    if isinstance(ts, pd.Timestamp):
+        if ts.tz is not None:
+            return ts.tz_convert(UK_TZ)
+        return ts.tz_localize("UTC").tz_convert(UK_TZ)
+    # Plain datetime
+    if hasattr(ts, "tzinfo") and ts.tzinfo is not None:
+        return ts.astimezone(UK_TZ)
+    return pytz.utc.localize(ts).astimezone(UK_TZ)
 
 def now_london_floor_minute():
     return datetime.now(UK_TZ).replace(second=0, microsecond=0)
@@ -105,22 +111,23 @@ def latest_nonzero(series: pd.Series):
 
 def _empty_symbol(sym: str):
     latest = {
-        "symbol": sym, "signal": "FLAT", "price_binance": None, "price_coingecko": None,
-        "price_diff_bps": None, "rsi14": None, "ema9_minus_21": None,
-        "timestamp": "", "volume_ok": None, "trend": "N/A"
+        "symbol": sym, "signal_filt": "FLAT", "signal_raw": "FLAT",
+        "price_binance": None, "price_coingecko": None, "price_diff_bps": None,
+        "rsi14": None, "ema9_minus_21": None, "timestamp": "",
+        "volume_ok": None, "trend": "N/A"
     }
     empty = pd.DataFrame({"close": [], "ema_fast": [], "ema_slow": [], "rsi14": []})
     hist = pd.DataFrame({"time": [], "signal": []})
     return latest, empty, hist, hist
 
 def pick_active(hist_df: pd.DataFrame, now_uk: datetime):
-    """Return the row at/just before 'now' (UK). hist_df['time'] is UK 'YYYY-MM-DD HH:MM'."""
+    """Return the row at/just before 'now' (UK). hist_df['time'] is 'YYYY-MM-DD HH:MM' in UK local."""
     if hist_df is None or hist_df.empty or "time" not in hist_df.columns or "signal" not in hist_df.columns:
         return None
     df = hist_df.copy()
     df["t"] = pd.to_datetime(df["time"], format="%Y-%m-%d %H:%M", errors="coerce")
     df = df.dropna(subset=["t"])
-    # localize to UK (strings already represent UK local)
+    # localize to UK (strings already represent UK)
     df["t"] = df["t"].apply(lambda t: UK_TZ.localize(t) if t.tzinfo is None else t.astimezone(UK_TZ))
     df = df.sort_values("t")
     df_now = df[df["t"] <= now_uk]
@@ -130,12 +137,12 @@ def pick_active(hist_df: pd.DataFrame, now_uk: datetime):
     return {"time": row["time"], "signal": row["signal"]}
 
 # ==============================
-# Per-symbol pipeline (with Volume + Trend filters)
+# Per-symbol pipeline (Raw + Filtered)
 # ==============================
 async def fetch_symbol(session, sym: str):
     gecko_map = {"BTCUSDT": ["bitcoin"], "ETCUSDT": ["ethereum-classic"]}
 
-    # 1) Fetch OHLC
+    # 1) OHLC
     ohlc = await get_klines(session, sym,
                             interval=cfg["intraday"]["interval"],
                             days=int(cfg["intraday"]["lookback_days"]))
@@ -143,13 +150,13 @@ async def fetch_symbol(session, sym: str):
         st.warning(f"{sym}: no market data returned. Retrying on next refresh.")
         return _empty_symbol(sym)
 
-    # 2) Build features (RSI, EMA9/21, etc.)
+    # 2) Features
     feats = build_features_5m(ohlc)
     if feats is None or feats.empty:
         st.warning(f"{sym}: insufficient data for features (5m).")
         return _empty_symbol(sym)
 
-    # --- Force feature index to UK local time ---
+    # --- Force features index to UK local time (robust) ---
     try:
         if getattr(feats.index, "tz", None) is None and getattr(feats.index, "tzinfo", None) is None:
             feats.index = feats.index.tz_localize("UTC")
@@ -158,43 +165,35 @@ async def fetch_symbol(session, sym: str):
                 feats.index = feats.index.tz_convert("UTC")
             except Exception:
                 pass
-        feats.index = feats.index.tz_convert("Europe/London")
+        feats.index = feats.index.tz_convert(UK_TZ)
     except Exception:
         feats.index = pd.to_datetime(feats.index)
-        feats.index = feats.index.tz_localize("Europe/London")
+        feats.index = feats.index.tz_localize(UK_TZ)
 
-    # Ensure volume is present
+    # Ensure volume exists (for filters later)
     if "volume" not in feats.columns and "volume" in ohlc.columns:
         feats["volume"] = ohlc["volume"].values
     elif "volume" not in feats.columns:
         feats["volume"] = pd.Series(index=feats.index, dtype="float64").fillna(0.0)
 
-    # Add trend EMAs for filters
-    feats["ema50"] = feats["close"].ewm(span=50, adjust=False).mean()
-    feats["ema200"] = feats["close"].ewm(span=200, adjust=False).mean()
-
-    # 3) Raw signals (original strategy + throttling)
+    # 3) RAW signals (no extra filters) + throttling
     scfg = ScalperConfig(min_minutes_between_signals=int(min_gap),
                          max_signals_per_day=int(max_day))
     sigs_raw = combine_signals_5m(feats, scfg)  # -1/0/+1
 
-    # 4) Filters
-    # Volume filter: last bar volume > 1.5x rolling 20-bar mean
+    # 4) FILTERS (Volume + Trend)
+    feats["ema50"] = feats["close"].ewm(span=50, adjust=False).mean()
+    feats["ema200"] = feats["close"].ewm(span=200, adjust=False).mean()
     vol_mean20 = feats["volume"].rolling(20, min_periods=20).mean()
     vol_ok_series = feats["volume"] > (1.5 * vol_mean20)
-
-    # Trend filter: LONG only if EMA50>EMA200, SHORT only if EMA50<EMA200
     uptrend_series = feats["ema50"] > feats["ema200"]
     downtrend_series = feats["ema50"] < feats["ema200"]
 
-    # Apply filters to every bar of the raw signal
     sigs_filt = sigs_raw.copy()
-    # LONGs must satisfy vol_ok & uptrend
     sigs_filt[(sigs_raw > 0) & ~(vol_ok_series & uptrend_series)] = 0
-    # SHORTs must satisfy vol_ok & downtrend
     sigs_filt[(sigs_raw < 0) & ~(vol_ok_series & downtrend_series)] = 0
 
-    # 5) Cross-verify price (robust)
+    # 5) Cross-verify price
     gecko_px = None
     try:
         cg = await coingecko_price(session, gecko_map[sym])
@@ -210,52 +209,43 @@ async def fetch_symbol(session, sym: str):
         if gecko_px is not None else None
     )
 
-    # 6) Latest filtered snapshot
-    idx_last, val_last = latest_nonzero(sigs_filt)
-    if idx_last is None:
-        latest = {
-            "symbol": sym, "signal": "FLAT",
-            "price_binance": round(last_close, 2),
-            "price_coingecko": None if gecko_px is None else round(float(gecko_px), 2),
-            "price_diff_bps": None if diff_bps is None else round(float(diff_bps), 1),
-            "rsi14": round(float(feats["rsi14"].iloc[-1]), 1),
-            "ema9_minus_21": round(float(feats["ema_fast"].iloc[-1] - feats["ema_slow"].iloc[-1]), 2),
-            "timestamp": feats.index[-1].strftime("%Y-%m-%d %H:%M %Z"),
-            "volume_ok": bool(vol_ok_series.iloc[-1]) if not vol_ok_series.isna().iloc[-1] else None,
-            "trend": "Uptrend" if uptrend_series.iloc[-1] else ("Downtrend" if downtrend_series.iloc[-1] else "Sideways"),
-        }
-    else:
-        direction = "LONG" if val_last > 0 else "SHORT"
-        latest = {
-            "symbol": sym, "signal": direction,
-            "price_binance": round(float(feats.loc[idx_last, "close"]), 2),
-            "price_coingecko": None if gecko_px is None else round(float(gecko_px), 2),
-            "price_diff_bps": None if diff_bps is None else round(float(diff_bps), 1),
-            "rsi14": round(float(feats.loc[idx_last, "rsi14"]), 1),
-            "ema9_minus_21": round(float(feats.loc[idx_last, "ema_fast"] - feats.loc[idx_last, "ema_slow"]), 2),
-            "timestamp": to_london(idx_last).strftime("%Y-%m-%d %H:%M %Z"),
-            "volume_ok": bool(vol_ok_series.loc[idx_last]) if not pd.isna(vol_ok_series.loc[idx_last]) else None,
-            "trend": "Uptrend" if uptrend_series.loc[idx_last] else ("Downtrend" if downtrend_series.loc[idx_last] else "Sideways"),
-        }
+    # 6) Build "latest" snapshot for both raw & filtered
+    idx_filt, val_filt = latest_nonzero(sigs_filt)
+    idx_raw,  val_raw  = latest_nonzero(sigs_raw)
 
-    # 7) Histories (filtered vs raw)
-    nonzero_filt = sigs_filt[sigs_filt != 0].tail(30)
+    latest = {
+        "symbol": sym,
+        "signal_filt": "FLAT" if idx_filt is None else ("LONG" if val_filt > 0 else "SHORT"),
+        "signal_raw":  "FLAT" if idx_raw  is None else ("LONG" if val_raw  > 0 else "SHORT"),
+        "price_binance": round(last_close, 2),
+        "price_coingecko": None if gecko_px is None else round(float(gecko_px), 2),
+        "price_diff_bps": None if diff_bps is None else round(float(diff_bps), 1),
+        "rsi14": round(float(feats["rsi14"].iloc[-1]), 1),
+        "ema9_minus_21": round(float(feats["ema_fast"].iloc[-1] - feats["ema_slow"].iloc[-1]), 2),
+        "timestamp": to_london(feats.index[-1]).strftime("%Y-%m-%d %H:%M %Z"),
+        "volume_ok": bool(vol_ok_series.iloc[-1]) if not vol_ok_series.isna().iloc[-1] else None,
+        "trend": "Uptrend" if uptrend_series.iloc[-1] else ("Downtrend" if downtrend_series.iloc[-1] else "Sideways"),
+    }
+
+    # 7) Histories (non-zero only), in UK time strings
+    nz_filt = sigs_filt[sigs_filt != 0].tail(30)
     hist_filt = pd.DataFrame({
-        "time": [to_london(t).strftime("%Y-%m-%d %H:%M") for t in nonzero_filt.index],
-        "signal": ["LONG" if v > 0 else "SHORT" for v in nonzero_filt.values]
+        "time": [to_london(t).strftime("%Y-%m-%d %H:%M") for t in nz_filt.index],
+        "signal": ["LONG" if v > 0 else "SHORT" for v in nz_filt.values]
     })
 
-    nonzero_raw = sigs_raw[sigs_raw != 0].tail(30)
+    nz_raw = sigs_raw[sigs_raw != 0].tail(30)
     hist_raw = pd.DataFrame({
-        "time": [to_london(t).strftime("%Y-%m-%d %H:%M") for t in nonzero_raw.index],
-        "signal": ["LONG" if v > 0 else "SHORT" for v in nonzero_raw.values]
+        "time": [to_london(t).strftime("%Y-%m-%d %H:%M") for t in nz_raw.index],
+        "signal": ["LONG" if v > 0 else "SHORT" for v in nz_raw.values]
     })
 
+    # Plot features (last 200 rows)
     plot_feats = feats.tail(200)[["close", "ema_fast", "ema_slow", "rsi14"]].copy()
     return latest, plot_feats, hist_filt, hist_raw
 
 # ==============================
-# Main fetch
+# Fetch
 # ==============================
 async def run():
     import aiohttp
@@ -266,17 +256,18 @@ async def run():
 results = asyncio.run(run())
 
 # ==============================
-# Active signal "NOW" banner (filtered)
+# Active signal "NOW" banner (Filtered)
 # ==============================
 now_uk = now_london_floor_minute()
 active_rows = []
-for (latest, feats, hist_filt, _raw) in results:
+for (latest, feats, hist_filt, _hist_raw) in results:
     act = pick_active(hist_filt, now_uk)
     if act:
         active_rows.append({
             "symbol": latest["symbol"],
             "active_signal": act["signal"],
-            "active_time (UK)": act["time"],
+            "active_since (UK)": act["time"],
+            "last_bar (UK)": to_london(feats.index[-1]).strftime("%Y-%m-%d %H:%M"),
             "price (approx)": latest["price_binance"]
         })
 
@@ -285,34 +276,46 @@ if active_rows:
     st.dataframe(pd.DataFrame(active_rows), use_container_width=True)
 
 # ==============================
-# Render per symbol
+# Live tables (Filtered + Raw)
 # ==============================
-st.subheader("Live Signals (filtered)")
-rows = [latest for (latest, _, _, _) in results]
+st.subheader("Summary (latest)")
+rows = [{
+    "symbol": latest["symbol"],
+    "filtered": latest["signal_filt"],
+    "raw": latest["signal_raw"],
+    "trend": latest["trend"],
+    "volume_ok": latest["volume_ok"],
+    "price_binance": latest["price_binance"],
+    "price_coingecko": latest["price_coingecko"],
+    "diff_bps": latest["price_diff_bps"],
+    "last_bar (UK)": latest["timestamp"],
+} for (latest, _, _, _) in results]
 st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
+# ==============================
+# Per-symbol sections
+# ==============================
 left, right = st.columns(2)
 for i, (latest, feats, hist_filt, hist_raw) in enumerate(results):
     with (left if i % 2 == 0 else right):
-        st.markdown(f"### {latest['symbol']} — {latest['signal']}")
-        st.caption(f"Trend: {latest['trend']} • Volume OK: {latest['volume_ok']} • Time: {latest['timestamp']}")
+        st.markdown(f"### {latest['symbol']} — Filtered: {latest['signal_filt']} • Raw: {latest['signal_raw']}")
+        st.caption(f"Trend: {latest['trend']} • Volume OK: {latest['volume_ok']} • Last bar: {latest['timestamp']}")
 
-        # ---- PRICE CHART: Close + EMA9 + EMA21 + Signal Arrows ----
+        # ---- PRICE CHART: Close + EMA9 + EMA21 + (Filtered) Signal Arrows ----
         if not feats.empty:
             plot_df = feats[["close", "ema_fast", "ema_slow"]].copy().reset_index()
             plot_df = plot_df.rename(columns={"ts": "time"})
 
-            # Build arrow points from filtered history (SAFE MERGE on UK minute key)
+            # Arrows from filtered history — SAFE merge on UK minute key
             sigs_for_plot = hist_filt.copy()
             if not sigs_for_plot.empty:
                 sigs_for_plot["time_key"] = sigs_for_plot["time"].astype(str)
-
                 ts = pd.to_datetime(plot_df["time"], errors="coerce")
                 # If naive, treat as UK; else convert to UK
                 if getattr(ts.dt, "tz", None) is None:
-                    ts = ts.dt.tz_localize("Europe/London", nonexistent="NaT", ambiguous="NaT")
+                    ts = ts.dt.tz_localize(UK_TZ, nonexistent="NaT", ambiguous="NaT")
                 else:
-                    ts = ts.dt.tz_convert("Europe/London")
+                    ts = ts.dt.tz_convert(UK_TZ)
                 plot_df["time_key"] = ts.dt.strftime("%Y-%m-%d %H:%M")
 
                 join_df = plot_df[["time", "close", "time_key"]].merge(
@@ -352,7 +355,7 @@ for i, (latest, feats, hist_filt, hist_raw) in enumerate(results):
                 ],
             )
 
-            # Signal arrows
+            # Signal arrows (filtered)
             arrow_chart = alt.Chart(join_df).mark_text(
                 align="center", baseline="middle", fontSize=14, fontWeight="bold"
             ).encode(
@@ -373,7 +376,7 @@ for i, (latest, feats, hist_filt, hist_raw) in enumerate(results):
             # RSI bar chart
             st.bar_chart(feats[["rsi14"]])
 
-        # Recent signals table (filtered by default; raw optional)
+        # Filtered recent signals
         if hist_filt is not None and not hist_filt.empty:
             act = pick_active(hist_filt, now_london_floor_minute())
             hf = hist_filt.copy()
@@ -384,8 +387,10 @@ for i, (latest, feats, hist_filt, hist_raw) in enumerate(results):
                 )
                 hf = hf.sort_values(by=["ACTIVE_NOW", "time"], ascending=[False, False]).reset_index(drop=True)
             st.markdown("**Recent non-zero signals (filtered)**")
-            st.dataframe(hf, use_container_width=True, height=260)
+            st.dataframe(hf, use_container_width=True, height=240)
 
-        if show_raw and hist_raw is not None and not hist_raw.empty:
+        # Raw recent signals (optional)
+        if show_raw_table and hist_raw is not None and not hist_raw.empty:
             st.markdown("**Recent non-zero signals (raw, unfiltered)**")
-            st.dataframe(hist_raw, use_container_width=True, height=240)
+            st.dataframe(hist_raw.sort_values("time", ascending=False).reset_index(drop=True),
+                         use_container_width=True, height=240)
