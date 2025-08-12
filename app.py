@@ -15,6 +15,7 @@ import pandas as pd
 import streamlit as st
 import pytz
 import altair as alt
+import aiohttp  # used by safe fetchers
 
 from src.utils import load_yaml
 from src.data_sources import get_klines, coingecko_price
@@ -55,11 +56,9 @@ max_day = int(cfg.get("signals", {}).get(
 ))
 
 # ==============================
-# Symbol selector (ETH/BTC only)  <<< THIS IS THE BLOCK YOU ASKED FOR
+# Symbol selector (ETH/BTC only) — robust defaults
 # ==============================
 OPTIONS = ["ETHUSDT", "BTCUSDT"]
-
-# Read defaults from config, keep only supported symbols; fallback to ETH if empty
 cfg_syms = cfg.get("symbols", ["ETHUSDT"])
 default_syms = [s for s in cfg_syms if s in OPTIONS] or ["ETHUSDT"]
 
@@ -68,6 +67,11 @@ symbols = st.multiselect(
     OPTIONS,
     default=default_syms
 )
+
+# If user clears everything, auto-restore ETH to avoid empty results
+if not symbols:
+    st.warning("No symbols selected — defaulting to ETHUSDT.")
+    symbols = ["ETHUSDT"]
 
 # Other controls
 colA, colB, colC = st.columns(3)
@@ -83,7 +87,7 @@ show_provisional = st.checkbox("Show provisional (forming candle) — may change
 show_raw_table = st.checkbox("Show raw (unfiltered) table under each chart", value=True)
 
 # ==============================
-# Helpers (UK time, countdown)
+# Helpers (UK time, formatting, countdown)
 # ==============================
 def to_london(ts):
     if isinstance(ts, pd.Timestamp):
@@ -145,6 +149,76 @@ def _empty_symbol(sym: str):
     return latest, empty_feats, empty_hist, empty_hist
 
 # ==============================
+# Safe OHLC fetcher: your get_klines() → Binance Spot → Binance Futures
+# ==============================
+INTERVAL_MAP = {
+    "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m",
+    "30m": "30m", "1h": "1h", "2h": "2h", "4h": "4h",
+    "1d": "1d"
+}
+
+async def _binance_spot_klines(session: aiohttp.ClientSession, symbol: str, interval: str, days: int):
+    iv = INTERVAL_MAP.get(interval, "5m")
+    per_day_5m = 12 * 24
+    limit = min(1500, max(100, days * per_day_5m))
+    url = "https://api.binance.com/api/v3/klines"
+    params = {"symbol": symbol, "interval": iv, "limit": limit}
+    async with session.get(url, params=params, timeout=20) as r:
+        if r.status != 200:
+            return pd.DataFrame()
+        data = await r.json()
+    if not data:
+        return pd.DataFrame()
+    cols = ["open_time","open","high","low","close","volume","close_time","qav","n","tbbav","tbqav","ignore"]
+    df = pd.DataFrame(data, columns=cols)
+    for c in ["open","high","low","close","volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    return df[["open_time","open","high","low","close","volume"]]
+
+async def _binance_futures_klines(session: aiohttp.ClientSession, symbol: str, interval: str, days: int):
+    iv = INTERVAL_MAP.get(interval, "5m")
+    per_day_5m = 12 * 24
+    limit = min(1500, max(100, days * per_day_5m))
+    url = "https://fapi.binance.com/fapi/v1/klines"
+    params = {"symbol": symbol, "interval": iv, "limit": limit}
+    async with session.get(url, params=params, timeout=20) as r:
+        if r.status != 200:
+            return pd.DataFrame()
+        data = await r.json()
+    if not data or isinstance(data, dict):
+        return pd.DataFrame()
+    cols = ["open_time","open","high","low","close","volume","close_time","qav","n","tbbav","tbqav","ignore"]
+    df = pd.DataFrame(data, columns=cols)
+    for c in ["open","high","low","close","volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    return df[["open_time","open","high","low","close","volume"]]
+
+async def get_klines_safe(session: aiohttp.ClientSession, symbol: str, interval: str, days: int) -> pd.DataFrame:
+    """
+    Try project's get_klines(); if empty, fall back to Binance Spot, then Futures.
+    Ensures columns: ['open_time','open','high','low','close','volume'] (open_time is tz-aware UTC).
+    """
+    # 1) Your existing source
+    try:
+        df = await get_klines(session, symbol, interval=interval, days=days)
+        if df is not None and not df.empty and "open_time" in df.columns:
+            return df
+    except Exception:
+        pass
+    # 2) Binance Spot
+    df_spot = await _binance_spot_klines(session, symbol, interval, days)
+    if not df_spot.empty:
+        return df_spot
+    # 3) Binance Futures
+    df_fut = await _binance_futures_klines(session, symbol, interval, days)
+    if not df_fut.empty:
+        return df_fut
+    # 4) Nothing
+    return pd.DataFrame()
+
+# ==============================
 # Per-symbol pipeline (Raw + Filters)
 # ==============================
 async def fetch_symbol(session, sym: str):
@@ -153,8 +227,8 @@ async def fetch_symbol(session, sym: str):
         "ETHUSDT": ["ethereum"],
     }
 
-    # 1) OHLC
-    ohlc = await get_klines(session, sym, interval=cfg["intraday"]["interval"], days=int(cfg["intraday"]["lookback_days"]))
+    # 1) OHLC (safe fetch)
+    ohlc = await get_klines_safe(session, sym, interval=cfg["intraday"]["interval"], days=int(cfg["intraday"]["lookback_days"]))
     if ohlc is None or ohlc.empty or "open_time" not in ohlc.columns:
         st.warning(f"{sym}: no market data returned. Retrying on next refresh.")
         return _empty_symbol(sym)
@@ -260,7 +334,6 @@ async def fetch_symbol(session, sym: str):
 # Fetch & header
 # ==============================
 async def run():
-    import aiohttp
     async with aiohttp.ClientSession() as session:
         tasks = [fetch_symbol(session, sym) for sym in symbols]
         return await asyncio.gather(*tasks)
