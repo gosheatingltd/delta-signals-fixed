@@ -1,0 +1,7 @@
+streamlit>=1.35
+pandas>=2.1
+numpy>=1.26
+aiohttp>=3.9
+feedparser>=6.0
+PyYAML>=6.0
+requests>=2.31

@@ -1,0 +1,35 @@
+symbols:
+  - BTCUSDT
+  - ETCUSDT
+
+signals:
+  min_gap_minutes: 20
+  max_per_day: 20
+  news_quorum_sources: 2
+
+cross_verify:
+  price_tolerance_bps: 15
+
+schedule:
+  poll_interval_seconds: 30
+  news_refresh_seconds: 60
+
+intraday:
+  interval: "5m"
+  lookback_days: 7
+  min_minutes_between_signals: 20
+  max_signals_per_day: 20
+
+risk:
+  max_leverage: 3
+  per_trade_risk_pct: 0.01
+  daily_loss_cap_pct: 0.03
+
+delta_api:
+  base_url: "https://api.delta.exchange"
+  key: ""
+  secret: ""
+  passphrase: ""
+
+storage:
+  data_dir: "./data"
