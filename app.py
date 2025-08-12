@@ -22,7 +22,7 @@ from src.signals_5m import combine_signals_5m, ScalperConfig
 
 st.set_page_config(page_title="⚡ Crypto Edge — 5-Minute Signals", layout="wide")
 st.title("⚡ Crypto Edge — 5-Minute Signals (BTC & ETC)")
-st.caption("Public data only • Cross-verified prices • Throttled to ~10–20 signals/day")
+st.caption("Public data only • Cross-verified prices • Filters: Volume + Trend • 5m timeframe")
 
 # ==============================
 # CONFIG (robust)
@@ -79,6 +79,8 @@ with colB:
 with colC:
     max_day = st.number_input("Max signals/day", 5, 50, max_day, 1)
 
+show_raw = st.checkbox("Show raw (unfiltered) signal history", value=False)
+
 # ==============================
 # Helpers
 # ==============================
@@ -92,10 +94,12 @@ def _empty_symbol(sym: str):
         "rsi14": None,
         "ema9_minus_21": None,
         "timestamp": "",
+        "volume_ok": None,
+        "trend": "N/A",
     }
     empty_feats = pd.DataFrame({"close": [], "ema_fast": [], "ema_slow": [], "rsi14": []})
     empty_hist = pd.DataFrame({"time": [], "signal": []})
-    return latest, empty_feats, empty_hist
+    return latest, empty_feats, empty_hist, empty_hist
 
 def to_london(ts):
     uk = pytz.timezone("Europe/London")
@@ -103,8 +107,15 @@ def to_london(ts):
         ts = pytz.utc.localize(ts)
     return ts.astimezone(uk)
 
+def latest_nonzero(series: pd.Series):
+    nz = series[series != 0]
+    if len(nz) == 0:
+        return None, 0
+    idx = nz.index[-1]
+    return idx, int(nz.iloc[-1])
+
 # ==============================
-# Per-symbol pipeline
+# Per-symbol pipeline (with filters)
 # ==============================
 async def fetch_symbol(session, sym: str):
     gecko_map = {"BTCUSDT": ["bitcoin"], "ETCUSDT": ["ethereum-classic"]}
@@ -126,13 +137,37 @@ async def fetch_symbol(session, sym: str):
         st.warning(f"{sym}: insufficient data for features (5m).")
         return _empty_symbol(sym)
 
-    # 3) Signals
+    # Ensure volume is present
+    if "volume" not in feats.columns:
+        feats["volume"] = ohlc["volume"].values
+
+    # Add trend EMAs for filters
+    feats["ema50"] = feats["close"].ewm(span=50, adjust=False).mean()
+    feats["ema200"] = feats["close"].ewm(span=200, adjust=False).mean()
+
+    # 3) Raw signals (original strategy + throttling)
     scfg = ScalperConfig(
         min_minutes_between_signals=int(min_gap), max_signals_per_day=int(max_day)
     )
-    sigs = combine_signals_5m(feats, scfg)
+    sigs_raw = combine_signals_5m(feats, scfg)  # -1/0/+1
 
-    # 4) CoinGecko (robust parse)
+    # 4) Filters
+    # Volume filter: last bar volume > 1.5x rolling 20-bar mean
+    vol_mean20 = feats["volume"].rolling(20, min_periods=20).mean()
+    vol_ok_series = feats["volume"] > (1.5 * vol_mean20)
+
+    # Trend filter: LONG only if EMA50>EMA200, SHORT only if EMA50<EMA200
+    uptrend_series = feats["ema50"] > feats["ema200"]
+    downtrend_series = feats["ema50"] < feats["ema200"]
+
+    # Apply filters to every bar of the raw signal
+    sigs_filt = sigs_raw.copy()
+    # LONGs must satisfy vol_ok & uptrend
+    sigs_filt[(sigs_raw > 0) & ~(vol_ok_series & uptrend_series)] = 0
+    # SHORTs must satisfy vol_ok & downtrend
+    sigs_filt[(sigs_raw < 0) & ~(vol_ok_series & downtrend_series)] = 0
+
+    # 5) Price cross-verify (robust parse)
     gecko_px = None
     try:
         cg = await coingecko_price(session, gecko_map[sym])
@@ -145,38 +180,61 @@ async def fetch_symbol(session, sym: str):
     last_close = float(feats["close"].iloc[-1])
     diff_bps = (
         abs(last_close - gecko_px) / ((last_close + gecko_px) / 2) * 10000
-        if gecko_px is not None
-        else None
+        if gecko_px is not None else None
     )
 
-    # 5) Latest row (UK time)
-    last_ts = feats.index[-1]
-    last_ts_uk = to_london(last_ts)
-
-    last_sig = int(sigs.iloc[-1]) if len(sigs) else 0
-    direction = "LONG" if last_sig > 0 else ("SHORT" if last_sig < 0 else "FLAT")
-    latest = {
-        "symbol": sym,
-        "signal": direction,
-        "price_binance": round(last_close, 2),
-        "price_coingecko": None if gecko_px is None else round(float(gecko_px), 2),
-        "price_diff_bps": None if diff_bps is None else round(float(diff_bps), 1),
-        "rsi14": round(float(feats["rsi14"].iloc[-1]), 1),
-        "ema9_minus_21": round(
-            float(feats["ema_fast"].iloc[-1] - feats["ema_slow"].iloc[-1]), 2
-        ),
-        "timestamp": last_ts_uk.strftime("%Y-%m-%d %H:%M %Z"),
-    }
-
-    nonzero = sigs[sigs != 0].tail(30)
-    hist = pd.DataFrame(
-        {
-            "time": [t.strftime("%Y-%m-%d %H:%M") for t in nonzero.index],
-            "signal": ["LONG" if v > 0 else "SHORT" for v in nonzero.values],
+    # 6) Determine latest filtered signal
+    idx_filt, val_filt = latest_nonzero(sigs_filt)
+    if idx_filt is None:
+        # No valid signal after filters
+        latest = {
+            "symbol": sym,
+            "signal": "FLAT",
+            "price_binance": round(last_close, 2),
+            "price_coingecko": None if gecko_px is None else round(float(gecko_px), 2),
+            "price_diff_bps": None if diff_bps is None else round(float(diff_bps), 1),
+            "rsi14": round(float(feats["rsi14"].iloc[-1]), 1),
+            "ema9_minus_21": round(float(feats["ema_fast"].iloc[-1] - feats["ema_slow"].iloc[-1]), 2),
+            "timestamp": to_london(feats.index[-1]).strftime("%Y-%m-%d %H:%M %Z"),
+            "volume_ok": bool(vol_ok_series.iloc[-1]) if not vol_ok_series.isna().iloc[-1] else None,
+            "trend": "Uptrend" if uptrend_series.iloc[-1] else ("Downtrend" if downtrend_series.iloc[-1] else "Sideways"),
         }
-    )
+    else:
+        direction = "LONG" if val_filt > 0 else "SHORT"
+        last_ts_uk = to_london(idx_filt)
+        latest = {
+            "symbol": sym,
+            "signal": direction,
+            "price_binance": round(float(feats.loc[idx_filt, "close"]), 2),
+            "price_coingecko": None if gecko_px is None else round(float(gecko_px), 2),
+            "price_diff_bps": None if diff_bps is None else round(float(diff_bps), 1),
+            "rsi14": round(float(feats.loc[idx_filt, "rsi14"]), 1),
+            "ema9_minus_21": round(float(feats.loc[idx_filt, "ema_fast"] - feats.loc[idx_filt, "ema_slow"]), 2),
+            "timestamp": last_ts_uk.strftime("%Y-%m-%d %H:%M %Z"),
+            "volume_ok": bool(vol_ok_series.loc[idx_filt]) if not pd.isna(vol_ok_series.loc[idx_filt]) else None,
+            "trend": "Uptrend" if uptrend_series.loc[idx_filt] else ("Downtrend" if downtrend_series.loc[idx_filt] else "Sideways"),
+        }
 
-    return latest, feats.tail(200)[["close", "ema_fast", "ema_slow", "rsi14"]], hist
+    # 7) Histories (filtered vs raw)
+    # Filtered history: only non-zero filtered signals
+    nonzero_filt = sigs_filt[sigs_filt != 0].tail(30)
+    hist_filt = pd.DataFrame({
+        "time": [to_london(t).strftime("%Y-%m-%d %H:%M") for t in nonzero_filt.index],
+        "signal": ["LONG" if v > 0 else "SHORT" for v in nonzero_filt.values]
+    })
+
+    # Raw history (for optional comparison)
+    nonzero_raw = sigs_raw[sigs_raw != 0].tail(30)
+    hist_raw = pd.DataFrame({
+        "time": [to_london(t).strftime("%Y-%m-%d %H:%M") for t in nonzero_raw.index],
+        "signal": ["LONG" if v > 0 else "SHORT" for v in nonzero_raw.values]
+    })
+
+    # Return feats with columns used for plotting
+    plot_feats = feats.tail(200)[["close", "ema_fast", "ema_slow", "rsi14"]].copy()
+    # Also attach the series we need for plotting arrows (time index, close)
+    plot_feats = plot_feats.copy()
+    return latest, plot_feats, hist_filt, hist_raw
 
 # ==============================
 # Main
@@ -192,52 +250,92 @@ results = asyncio.run(run())
 # ==============================
 # Render
 # ==============================
-st.subheader("Live Signals")
-rows = [latest for (latest, _, _) in results]
+st.subheader("Live Signals (filtered)")
+rows = [latest for (latest, _, _, _) in results]
 st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
 left, right = st.columns(2)
-for i, (latest, feats, hist) in enumerate(results):
+for i, (latest, feats, hist_filt, hist_raw) in enumerate(results):
     with (left if i % 2 == 0 else right):
-        st.markdown(f"### {latest['symbol']}")
+        st.markdown(f"### {latest['symbol']} — {latest['signal']}")
+        st.caption(f"Trend: {latest['trend']} • Volume OK: {latest['volume_ok']} • Time: {latest['timestamp']}")
 
-        # ---- PRICE CHART: Close + EMA9 + EMA21 (Altair) ----
+        # ---- PRICE CHART: Close + EMA9 + EMA21 + Signal Arrows ----
         if not feats.empty:
             plot_df = feats[["close", "ema_fast", "ema_slow"]].copy().reset_index()
             plot_df = plot_df.rename(columns={"ts": "time"})
+
+            # Build arrow points from filtered history
+            sigs_for_plot = hist_filt.copy()
+            if not sigs_for_plot.empty:
+                sigs_for_plot["time"] = pd.to_datetime(sigs_for_plot["time"])
+                # join to get price at that exact time
+                join_df = plot_df[["time", "close"]].merge(sigs_for_plot, on="time", how="inner")
+                # place arrows slightly above/below close
+                join_df["arrow_y"] = join_df.apply(
+                    lambda r: r["close"] * (1.005 if r["signal"] == "LONG" else 0.995), axis=1
+                )
+            else:
+                join_df = pd.DataFrame(columns=["time", "close", "signal", "arrow_y"])
+
+            # Long-form for EMAs/Close
             long_df = plot_df.melt("time", var_name="series", value_name="value")
             name_map = {"close": "Close", "ema_fast": "EMA 9", "ema_slow": "EMA 21"}
             long_df["series"] = long_df["series"].map(name_map)
 
-            line = (
-                alt.Chart(long_df)
-                .mark_line()
-                .encode(
-                    x=alt.X("time:T", title="Time (UK)"),
-                    y=alt.Y("value:Q", title="Price (USD)"),
-                    color=alt.Color(
-                        "series:N",
-                        title="Legend",
-                        scale=alt.Scale(
-                            domain=["Close", "EMA 9", "EMA 21"],
-                            range=["#1f77b4", "#e45756", "#4ea8de"],  # dark blue, red, light blue
-                        ),
+            # Price + EMAs
+            line_chart = alt.Chart(long_df).mark_line().encode(
+                x=alt.X("time:T", title="Time (UK)"),
+                y=alt.Y("value:Q", title="Price (USD)"),
+                color=alt.Color(
+                    "series:N",
+                    title="Legend",
+                    scale=alt.Scale(
+                        domain=["Close", "EMA 9", "EMA 21"],
+                        range=["#1f77b4", "#e45756", "#4ea8de"],
                     ),
-                    tooltip=[
-                        alt.Tooltip("time:T", title="Time"),
-                        alt.Tooltip("series:N", title="Series"),
-                        alt.Tooltip("value:Q", title="Value", format=",.2f"),
-                    ],
-                )
-                .properties(height=260)
-                .interactive()
+                ),
+                tooltip=[
+                    alt.Tooltip("time:T", title="Time"),
+                    alt.Tooltip("series:N", title="Series"),
+                    alt.Tooltip("value:Q", title="Value", format=",.2f"),
+                ],
             )
-            st.altair_chart(line, use_container_width=True)
+
+            # Signal arrows
+            arrow_chart = alt.Chart(join_df).mark_text(
+                align="center", baseline="middle", fontSize=14, fontWeight="bold"
+            ).encode(
+                x="time:T",
+                y="arrow_y:Q",
+                text=alt.condition(
+                    alt.datum.signal == "LONG",
+                    alt.value("▲"),
+                    alt.value("▼")
+                ),
+                color=alt.condition(
+                    alt.datum.signal == "LONG",
+                    alt.value("green"),
+                    alt.value("red")
+                ),
+                tooltip=[
+                    alt.Tooltip("time:T", title="Signal Time"),
+                    alt.Tooltip("signal:N", title="Signal Type"),
+                    alt.Tooltip("close:Q", title="Close", format=",.2f"),
+                ]
+            )
+
+            final_chart = (line_chart + arrow_chart).properties(height=260).interactive()
+            st.altair_chart(final_chart, use_container_width=True)
 
             # RSI bar chart
             st.bar_chart(feats[["rsi14"]])
 
-        # Recent signals table
-        if not hist.empty:
-            st.markdown("**Recent non-zero signals**")
-            st.dataframe(hist, use_container_width=True, height=240)
+        # Recent signals table (filtered by default; raw optional)
+        if not hist_filt.empty:
+            st.markdown("**Recent non-zero signals (filtered)**")
+            st.dataframe(hist_filt, use_container_width=True, height=240)
+
+        if show_raw and not hist_raw.empty:
+            st.markdown("**Recent non-zero signals (raw, unfiltered)**")
+            st.dataframe(hist_raw, use_container_width=True, height=240)
