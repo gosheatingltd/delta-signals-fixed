@@ -62,11 +62,7 @@ OPTIONS = ["ETHUSDT", "BTCUSDT"]
 cfg_syms = cfg.get("symbols", ["ETHUSDT"])
 default_syms = [s for s in cfg_syms if s in OPTIONS] or ["ETHUSDT"]
 
-symbols = st.multiselect(
-    "Symbols",
-    OPTIONS,
-    default=default_syms
-)
+symbols = st.multiselect("Symbols", OPTIONS, default=default_syms)
 
 # If user clears everything, auto-restore ETH to avoid empty results
 if not symbols:
@@ -142,7 +138,8 @@ def _empty_symbol(sym: str):
         "provisional_raw": "FLAT",
         "trend": "N/A",
         "volume_ok": None,
-        "last_bar": ""
+        "last_bar": "",
+        "source": "none"
     }
     empty_feats = pd.DataFrame({"close": [], "ema_fast": [], "ema_slow": [], "rsi14": []})
     empty_hist = pd.DataFrame({"time": [], "signal": []})
@@ -195,28 +192,29 @@ async def _binance_futures_klines(session: aiohttp.ClientSession, symbol: str, i
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
     return df[["open_time","open","high","low","close","volume"]]
 
-async def get_klines_safe(session: aiohttp.ClientSession, symbol: str, interval: str, days: int) -> pd.DataFrame:
+async def get_klines_safe(session: aiohttp.ClientSession, symbol: str, interval: str, days: int):
     """
-    Try project's get_klines(); if empty, fall back to Binance Spot, then Futures.
-    Ensures columns: ['open_time','open','high','low','close','volume'] (open_time is tz-aware UTC).
+    Try project's get_klines(); if empty, fall back to Binance Spot, then Binance Futures.
+    Returns (df, source_name) where source_name in {"project","binance_spot","binance_futures","none"}.
+    DataFrame has columns ['open_time','open','high','low','close','volume'] with tz-aware UTC 'open_time'.
     """
     # 1) Your existing source
     try:
         df = await get_klines(session, symbol, interval=interval, days=days)
         if df is not None and not df.empty and "open_time" in df.columns:
-            return df
+            return df, "project"
     except Exception:
         pass
     # 2) Binance Spot
     df_spot = await _binance_spot_klines(session, symbol, interval, days)
     if not df_spot.empty:
-        return df_spot
+        return df_spot, "binance_spot"
     # 3) Binance Futures
     df_fut = await _binance_futures_klines(session, symbol, interval, days)
     if not df_fut.empty:
-        return df_fut
+        return df_fut, "binance_futures"
     # 4) Nothing
-    return pd.DataFrame()
+    return pd.DataFrame(), "none"
 
 # ==============================
 # Per-symbol pipeline (Raw + Filters)
@@ -227,17 +225,21 @@ async def fetch_symbol(session, sym: str):
         "ETHUSDT": ["ethereum"],
     }
 
-    # 1) OHLC (safe fetch)
-    ohlc = await get_klines_safe(session, sym, interval=cfg["intraday"]["interval"], days=int(cfg["intraday"]["lookback_days"]))
+    # 1) OHLC (safe fetch with source label)
+    ohlc, source_name = await get_klines_safe(session, sym, interval=cfg["intraday"]["interval"], days=int(cfg["intraday"]["lookback_days"]))
     if ohlc is None or ohlc.empty or "open_time" not in ohlc.columns:
-        st.warning(f"{sym}: no market data returned. Retrying on next refresh.")
-        return _empty_symbol(sym)
+        st.error(f"{sym}: no market data from project/spot/futures. Check symbol/endpoint.")
+        latest, empty_feats, empty_hist, empty_hist2 = _empty_symbol(sym)
+        latest["source"] = "none"
+        return latest, empty_feats, empty_hist, empty_hist2
 
     # 2) Features
     feats = build_features_5m(ohlc)
     if feats is None or feats.empty:
         st.warning(f"{sym}: insufficient data for features (5m).")
-        return _empty_symbol(sym)
+        latest, empty_feats, empty_hist, empty_hist2 = _empty_symbol(sym)
+        latest["source"] = source_name
+        return latest, empty_feats, empty_hist, empty_hist2
 
     # Ensure index UK tz-aware for display
     try:
@@ -312,6 +314,7 @@ async def fetch_symbol(session, sym: str):
         "trend": "Uptrend" if uptrend_series.iloc[-1] else ("Downtrend" if downtrend_series.iloc[-1] else "Sideways"),
         "volume_ok": bool(vol_ok_series.iloc[-1]) if not vol_ok_series.isna().iloc[-1] else None,
         "last_bar": fmt12(feats.index[-1]),
+        "source": source_name
     }
 
     # 8) Histories (UK, 12-hour)
@@ -344,12 +347,13 @@ next_time, tminus = countdown_to_next_bar()
 st.info(f"🕒 Current UK time: **{now_uk_floor().strftime('%I:%M %p %Z')}**  |  Next 5-min bar: **{next_time}** (T–{tminus})")
 
 # ==============================
-# Summary: filtered + raw stance
+# Summary: filtered + raw stance (with DATA SOURCE)
 # ==============================
 rows = []
 for (latest, feats, hist_filt, hist_raw) in results:
     rows.append({
         "symbol": latest["symbol"],
+        "data_source": latest.get("source", "unknown"),
         "trade_now (filtered)": latest["signal_filtered"],
         "provisional (filtered)": latest["provisional_filtered"] if show_provisional else "—",
         "trade_now (raw)": latest["signal_raw"],
@@ -376,7 +380,7 @@ left, right = st.columns(2)
 for i, (latest, feats, hist_filt, hist_raw) in enumerate(results):
     with (left if i % 2 == 0 else right):
         st.markdown(f"### {latest['symbol']} — Filtered: **{latest['signal_filtered']}** • Raw: **{latest['signal_raw']}**")
-        st.caption(f"Trend: {latest['trend']} • Volume OK: {latest['volume_ok']} • Last bar: {latest['last_bar']}")
+        st.caption(f"Data source: {latest.get('source','unknown')} • Trend: {latest['trend']} • Volume OK: {latest['volume_ok']} • Last bar: {latest['last_bar']}")
 
         # ---- PRICE CHART: Close + EMA9 + EMA21 (Altair) ----
         if not feats.empty:
