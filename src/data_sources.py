@@ -134,6 +134,19 @@ async def get_klines(session, symbol: str, interval: str = "5m", days: int = 7):
 
 async def coingecko_price(session, ids):
     url = "https://api.coingecko.com/api/v3/simple/price"
-    params = {"ids": ",".join(ids), "vs_currencies": "usd"}
+    if isinstance(ids, (list, tuple)):
+        ids_list = list(ids)
+    else:
+        ids_list = [ids]
+    params = {"ids": ",".join(ids_list), "vs_currencies": "usd"}
     data = await fetch_json(session, url, params)
-    return data or {}
+    out = {}
+    if isinstance(data, dict):
+        for k in ids_list:
+            v = data.get(k)
+            if isinstance(v, dict) and "usd" in v and v["usd"] is not None:
+                try:
+                    out[k] = float(v["usd"])
+                except Exception:
+                    pass
+    return out
