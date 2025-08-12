@@ -14,6 +14,7 @@ import pandas as pd
 import streamlit as st
 import pytz
 import altair as alt
+from datetime import datetime
 
 from src.utils import load_yaml
 from src.data_sources import get_klines, coingecko_price
@@ -84,6 +85,8 @@ show_raw = st.checkbox("Show raw (unfiltered) signal history", value=False)
 # ==============================
 # Helpers
 # ==============================
+UK_TZ = pytz.timezone("Europe/London")
+
 def _empty_symbol(sym: str):
     latest = {
         "symbol": sym,
@@ -102,10 +105,9 @@ def _empty_symbol(sym: str):
     return latest, empty_feats, empty_hist, empty_hist
 
 def to_london(ts):
-    uk = pytz.timezone("Europe/London")
     if getattr(ts, "tzinfo", None) is None:
         ts = pytz.utc.localize(ts)
-    return ts.astimezone(uk)
+    return ts.astimezone(UK_TZ)
 
 def latest_nonzero(series: pd.Series):
     nz = series[series != 0]
@@ -113,6 +115,11 @@ def latest_nonzero(series: pd.Series):
         return None, 0
     idx = nz.index[-1]
     return idx, int(nz.iloc[-1])
+
+def now_london_floor_minute():
+    # current UK time rounded down to minute
+    now_uk = datetime.now(UK_TZ).replace(second=0, microsecond=0)
+    return now_uk
 
 # ==============================
 # Per-symbol pipeline (with filters)
@@ -246,7 +253,41 @@ async def run():
 results = asyncio.run(run())
 
 # ==============================
-# Render
+# Build a "NOW" banner (latest actionable at current UK time)
+# ==============================
+now_uk = now_london_floor_minute()
+
+def pick_active(hist_df: pd.DataFrame):
+    """Given a hist table with ['time','signal'] as UK strings, return the row at/just before now."""
+    if hist_df is None or hist_df.empty:
+        return None
+    df = hist_df.copy()
+    df["t"] = pd.to_datetime(df["time"])
+    # Attach UK tz (the strings are already in UK local time)
+    df["t"] = df["t"].apply(lambda t: UK_TZ.localize(t) if t.tzinfo is None else t.astimezone(UK_TZ))
+    df = df.sort_values("t")
+    df_now = df[df["t"] <= now_uk]
+    if df_now.empty:
+        return None
+    return df_now.iloc[-1][["time", "signal"]].to_dict()
+
+active_rows = []
+for (latest, feats, hist_filt, hist_raw) in results:
+    act = pick_active(hist_filt)
+    if act:
+        active_rows.append({
+            "symbol": latest["symbol"],
+            "active_signal": act["signal"],
+            "active_time (UK)": act["time"],
+            "price (approx)": latest["price_binance"]
+        })
+
+if active_rows:
+    st.subheader("🚨 Active signal now (filtered)")
+    st.dataframe(pd.DataFrame(active_rows), use_container_width=True)
+
+# ==============================
+# Render per symbol
 # ==============================
 st.subheader("Live Signals (filtered)")
 rows = [latest for (latest, _, _, _) in results]
@@ -264,38 +305,38 @@ for i, (latest, feats, hist_filt, hist_raw) in enumerate(results):
             plot_df = plot_df.rename(columns={"ts": "time"})
 
             # Build arrow points from filtered history (SAFE MERGE on UK minute key)
-sigs_for_plot = hist_filt.copy()
-if not sigs_for_plot.empty:
-    # hist_filt["time"] is already UK strings like "YYYY-MM-DD HH:MM"
-    sigs_for_plot["time_key"] = sigs_for_plot["time"].astype(str)
+            sigs_for_plot = hist_filt.copy()
+            if not sigs_for_plot.empty:
+                # hist_filt["time"] is UK strings like "YYYY-MM-DD HH:MM"
+                sigs_for_plot["time_key"] = sigs_for_plot["time"].astype(str)
 
-    # Create a matching key from plot_df times → UK strings at minute resolution
-    ts = pd.to_datetime(plot_df["time"], errors="coerce")
+                # Create a matching key from plot_df times → UK strings at minute resolution
+                ts = pd.to_datetime(plot_df["time"], errors="coerce")
 
-    # Only localize if timestamps are tz-naive; otherwise just convert
-    if getattr(ts.dt, "tz", None) is None:
-        ts = ts.dt.tz_localize("UTC", nonexistent="NaT", ambiguous="NaT")
+                # Only localize if timestamps are tz-naive; otherwise just convert
+                if getattr(ts.dt, "tz", None) is None:
+                    ts = ts.dt.tz_localize("UTC", nonexistent="NaT", ambiguous="NaT")
 
-    plot_df["time_key"] = (
-        ts.dt.tz_convert("Europe/London")
-          .dt.strftime("%Y-%m-%d %H:%M")
-    )
+                plot_df["time_key"] = (
+                    ts.dt.tz_convert("Europe/London")
+                      .dt.strftime("%Y-%m-%d %H:%M")
+                )
 
-    # Merge on the uniform string key
-    join_df = plot_df[["time", "close", "time_key"]].merge(
-        sigs_for_plot[["time_key", "signal"]],
-        on="time_key",
-        how="inner",
-        validate="m:1"
-    )
+                # Merge on the uniform string key
+                join_df = plot_df[["time", "close", "time_key"]].merge(
+                    sigs_for_plot[["time_key", "signal"]],
+                    on="time_key",
+                    how="inner",
+                    validate="m:1"
+                )
 
-    # Place arrows slightly above/below price
-    join_df["arrow_y"] = join_df.apply(
-        lambda r: r["close"] * (1.005 if r["signal"] == "LONG" else 0.995),
-        axis=1
-    )
-else:
-    join_df = pd.DataFrame(columns=["time", "close", "signal", "arrow_y"])
+                # Place arrows slightly above/below price
+                join_df["arrow_y"] = join_df.apply(
+                    lambda r: r["close"] * (1.005 if r["signal"] == "LONG" else 0.995),
+                    axis=1
+                )
+            else:
+                join_df = pd.DataFrame(columns=["time", "close", "signal", "arrow_y"])
 
             # Long-form for EMAs/Close
             long_df = plot_df.melt("time", var_name="series", value_name="value")
@@ -352,8 +393,18 @@ else:
 
         # Recent signals table (filtered by default; raw optional)
         if not hist_filt.empty:
+            # mark the active (NOW) row
+            act = pick_active(hist_filt)
+            hf = hist_filt.copy()
+            if act:
+                hf["ACTIVE_NOW"] = hf.apply(
+                    lambda r: "◉ NOW" if (r["time"] == act["time"]) and (r["signal"] == act["signal"]) else "",
+                    axis=1
+                )
+                # put active row at top for visibility
+                hf = hf.sort_values(by=["ACTIVE_NOW", "time"], ascending=[False, False]).reset_index(drop=True)
             st.markdown("**Recent non-zero signals (filtered)**")
-            st.dataframe(hist_filt, use_container_width=True, height=240)
+            st.dataframe(hf, use_container_width=True, height=260)
 
         if show_raw and not hist_raw.empty:
             st.markdown("**Recent non-zero signals (raw, unfiltered)**")
