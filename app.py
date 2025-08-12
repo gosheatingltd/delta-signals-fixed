@@ -23,9 +23,9 @@ from src.signals_5m import combine_signals_5m, ScalperConfig
 
 UK_TZ = pytz.timezone("Europe/London")
 
-st.set_page_config(page_title="⚡ Crypto Edge — 5-Min Signals (BTC & ETH)", layout="wide")
-st.title("⚡ Crypto Edge — 5-Minute Signals (BTC & ETH)")
-st.caption("Public data only • Cross-verified prices • 5m timeframe • 12-hour clock")
+st.set_page_config(page_title="⚡ Crypto Edge — 5-Min Signals (ETH & BTC)", layout="wide")
+st.title("⚡ Crypto Edge — 5-Minute Signals (ETH & BTC)")
+st.caption("Public data only • Cross-verified prices • 5m timeframe • 12-hour clock • Filtered + Raw")
 
 # ==============================
 # CONFIG
@@ -55,13 +55,21 @@ max_day = int(cfg.get("signals", {}).get(
 ))
 
 # ==============================
-# Controls
+# Symbol selector (ETH/BTC only)  <<< THIS IS THE BLOCK YOU ASKED FOR
 # ==============================
+OPTIONS = ["ETHUSDT", "BTCUSDT"]
+
+# Read defaults from config, keep only supported symbols; fallback to ETH if empty
+cfg_syms = cfg.get("symbols", ["ETHUSDT"])
+default_syms = [s for s in cfg_syms if s in OPTIONS] or ["ETHUSDT"]
+
 symbols = st.multiselect(
     "Symbols",
-    ["ETHUSDT", "BTCUSDT"],                    # ETH + BTC only
-    default=cfg.get("symbols", ["ETHUSDT"])    # default ETH
+    OPTIONS,
+    default=default_syms
 )
+
+# Other controls
 colA, colB, colC = st.columns(3)
 with colA:
     poll = st.number_input("Refresh (seconds)", 15, 120,
@@ -71,13 +79,13 @@ with colB:
 with colC:
     max_day = st.number_input("Max signals/day", 5, 50, max_day, 1)
 
-show_provisional = st.checkbox("Show provisional signal (forming candle) — may change on close", value=True)
+show_provisional = st.checkbox("Show provisional (forming candle) — may change on close", value=True)
+show_raw_table = st.checkbox("Show raw (unfiltered) table under each chart", value=True)
 
 # ==============================
 # Helpers (UK time, countdown)
 # ==============================
 def to_london(ts):
-    """Convert timestamp to Europe/London correctly and return pandas.Timestamp."""
     if isinstance(ts, pd.Timestamp):
         if ts.tz is not None:
             return ts.tz_convert(UK_TZ)
@@ -86,10 +94,10 @@ def to_london(ts):
         return pd.Timestamp(ts.astimezone(UK_TZ))
     return pd.Timestamp(pytz.utc.localize(ts).astimezone(UK_TZ))
 
-def fmt12(ts):  # pretty 12-hour format
+def fmt12(ts):        # "YYYY-mm-dd HH:MM AM/PM TZ"
     return to_london(ts).strftime("%Y-%m-%d %I:%M %p %Z")
 
-def fmt12_no_tz(ts):
+def fmt12_no_tz(ts):  # "YYYY-mm-dd HH:MM AM/PM"
     return to_london(ts).strftime("%Y-%m-%d %I:%M %p")
 
 def now_uk_floor():
@@ -117,21 +125,27 @@ def latest_nonzero(series: pd.Series):
 def _empty_symbol(sym: str):
     latest = {
         "symbol": sym,
-        "signal": "FLAT",
+        "signal_filtered": "FLAT",
+        "signal_raw": "FLAT",
         "price_binance": None,
         "price_coingecko": None,
         "price_diff_bps": None,
         "rsi14": None,
         "ema9_minus_21": None,
-        "timestamp": "",
-        "provisional": "FLAT"
+        "active_since_filtered": "",
+        "active_since_raw": "",
+        "provisional_filtered": "FLAT",
+        "provisional_raw": "FLAT",
+        "trend": "N/A",
+        "volume_ok": None,
+        "last_bar": ""
     }
     empty_feats = pd.DataFrame({"close": [], "ema_fast": [], "ema_slow": [], "rsi14": []})
     empty_hist = pd.DataFrame({"time": [], "signal": []})
-    return latest, empty_feats, empty_hist, 0
+    return latest, empty_feats, empty_hist, empty_hist
 
 # ==============================
-# Per-symbol pipeline (RAW strategy; ETH + BTC)
+# Per-symbol pipeline (Raw + Filters)
 # ==============================
 async def fetch_symbol(session, sym: str):
     gecko_map = {
@@ -151,7 +165,7 @@ async def fetch_symbol(session, sym: str):
         st.warning(f"{sym}: insufficient data for features (5m).")
         return _empty_symbol(sym)
 
-    # Ensure index is UK tz-aware for display
+    # Ensure index UK tz-aware for display
     try:
         if getattr(feats.index, "tz", None) is None and getattr(feats.index, "tzinfo", None) is None:
             feats.index = feats.index.tz_localize("UTC")
@@ -166,15 +180,32 @@ async def fetch_symbol(session, sym: str):
 
     # 3) Signals (raw) + throttling
     scfg = ScalperConfig(min_minutes_between_signals=int(min_gap), max_signals_per_day=int(max_day))
-    sigs = combine_signals_5m(feats, scfg)  # -1/0/+1
+    sigs_raw = combine_signals_5m(feats, scfg)  # -1/0/+1
 
-    # 4) Provisional preview (forming candle)
-    # NOTE: Without websocket/partial candles, this is effectively the last closed bar.
-    # It still gives a heads-up, but can only change on the next close.
-    provisional_val = int(sigs.iloc[-1]) if len(sigs) else 0
-    provisional = "LONG" if provisional_val > 0 else ("SHORT" if provisional_val < 0 else "FLAT")
+    # 4) Filters (Volume + Trend)
+    feats["ema50"] = feats["close"].ewm(span=50, adjust=False).mean()
+    feats["ema200"] = feats["close"].ewm(span=200, adjust=False).mean()
+    if "volume" not in feats.columns and "volume" in ohlc.columns:
+        feats["volume"] = ohlc["volume"].values
+    elif "volume" not in feats.columns:
+        feats["volume"] = pd.Series(index=feats.index, dtype="float64").fillna(0.0)
 
-    # 5) Cross-verify price
+    vol_mean20 = feats["volume"].rolling(20, min_periods=20).mean()
+    vol_ok_series = feats["volume"] > (1.5 * vol_mean20)
+    uptrend_series = feats["ema50"] > feats["ema200"]
+    downtrend_series = feats["ema50"] < feats["ema200"]
+
+    sigs_filt = sigs_raw.copy()
+    sigs_filt[(sigs_raw > 0) & ~(vol_ok_series & uptrend_series)] = 0
+    sigs_filt[(sigs_raw < 0) & ~(vol_ok_series & downtrend_series)] = 0
+
+    # 5) Provisional previews (forming candle)
+    prov_raw_val = int(sigs_raw.iloc[-1]) if len(sigs_raw) else 0
+    prov_filt_val = int(sigs_filt.iloc[-1]) if len(sigs_filt) else 0
+    provisional_raw = "LONG" if prov_raw_val > 0 else ("SHORT" if prov_raw_val < 0 else "FLAT")
+    provisional_filt = "LONG" if prov_filt_val > 0 else ("SHORT" if prov_filt_val < 0 else "FLAT")
+
+    # 6) Cross-verify price
     gecko_px = None
     try:
         cg = await coingecko_price(session, gecko_map[sym])
@@ -187,38 +218,46 @@ async def fetch_symbol(session, sym: str):
     last_close = float(feats["close"].iloc[-1])
     diff_bps = (abs(last_close - gecko_px) / ((last_close + gecko_px) / 2) * 10000) if gecko_px is not None else None
 
-    # 6) Latest closed-bar stance (official)
-    idx_last, val_last = latest_nonzero(sigs)
-    if idx_last is None:
-        direction = "FLAT"
-        ts_label = fmt12(feats.index[-1])
-    else:
-        direction = "LONG" if val_last > 0 else "SHORT"
-        ts_label = fmt12(idx_last)
+    # 7) Latest snapshots
+    idx_filt, val_filt = latest_nonzero(sigs_filt)
+    idx_raw,  val_raw  = latest_nonzero(sigs_raw)
 
     latest = {
         "symbol": sym,
-        "signal": direction,
+        "signal_filtered": "FLAT" if idx_filt is None else ("LONG" if val_filt > 0 else "SHORT"),
+        "signal_raw":      "FLAT" if idx_raw  is None else ("LONG" if val_raw  > 0 else "SHORT"),
         "price_binance": round(last_close, 2),
         "price_coingecko": None if gecko_px is None else round(float(gecko_px), 2),
         "price_diff_bps": None if diff_bps is None else round(float(diff_bps), 1),
         "rsi14": round(float(feats["rsi14"].iloc[-1]), 1),
         "ema9_minus_21": round(float(feats["ema_fast"].iloc[-1] - feats["ema_slow"].iloc[-1]), 2),
-        "timestamp": ts_label,     # 12-hour clock
-        "provisional": provisional # preview for forming candle
+        "active_since_filtered": "—" if idx_filt is None else fmt12(idx_filt),
+        "active_since_raw":      "—" if idx_raw  is None else fmt12(idx_raw),
+        "provisional_filtered": provisional_filt,
+        "provisional_raw": provisional_raw,
+        "trend": "Uptrend" if uptrend_series.iloc[-1] else ("Downtrend" if downtrend_series.iloc[-1] else "Sideways"),
+        "volume_ok": bool(vol_ok_series.iloc[-1]) if not vol_ok_series.isna().iloc[-1] else None,
+        "last_bar": fmt12(feats.index[-1]),
     }
 
-    # 7) History (UK, 12-hour)
-    nonzero = sigs[sigs != 0].tail(30)
-    hist = pd.DataFrame({
-        "time": [fmt12_no_tz(t) for t in nonzero.index],
-        "signal": ["LONG" if v > 0 else "SHORT" for v in nonzero.values],
+    # 8) Histories (UK, 12-hour)
+    nz_filt = sigs_filt[sigs_filt != 0].tail(30)
+    hist_filt = pd.DataFrame({
+        "time": [fmt12_no_tz(t) for t in nz_filt.index],
+        "signal": ["LONG" if v > 0 else "SHORT" for v in nz_filt.values],
     })
 
-    return latest, feats.tail(200)[["close", "ema_fast", "ema_slow", "rsi14"]], hist, provisional_val
+    nz_raw = sigs_raw[sigs_raw != 0].tail(30)
+    hist_raw = pd.DataFrame({
+        "time": [fmt12_no_tz(t) for t in nz_raw.index],
+        "signal": ["LONG" if v > 0 else "SHORT" for v in nz_raw.values],
+    })
+
+    plot_feats = feats.tail(200)[["close", "ema_fast", "ema_slow", "rsi14"]].copy()
+    return latest, plot_feats, hist_filt, hist_raw
 
 # ==============================
-# Fetch & Header: Trade-Now panel
+# Fetch & header
 # ==============================
 async def run():
     import aiohttp
@@ -232,16 +271,21 @@ next_time, tminus = countdown_to_next_bar()
 st.info(f"🕒 Current UK time: **{now_uk_floor().strftime('%I:%M %p %Z')}**  |  Next 5-min bar: **{next_time}** (T–{tminus})")
 
 # ==============================
-# Summary: current stance (official) + provisional
+# Summary: filtered + raw stance
 # ==============================
 rows = []
-for (latest, feats, hist, last_sig_val) in results:
+for (latest, feats, hist_filt, hist_raw) in results:
     rows.append({
         "symbol": latest["symbol"],
-        "trade_now (official)": latest["signal"],
-        "provisional (forming)": latest["provisional"] if show_provisional else "—",
-        "last_bar (UK)": feats.index[-1].strftime("%Y-%m-%d %I:%M %p %Z"),
-        "active_since": latest["timestamp"],  # when the current posture began
+        "trade_now (filtered)": latest["signal_filtered"],
+        "provisional (filtered)": latest["provisional_filtered"] if show_provisional else "—",
+        "trade_now (raw)": latest["signal_raw"],
+        "provisional (raw)": latest["provisional_raw"] if show_provisional else "—",
+        "trend": latest["trend"],
+        "volume_ok": latest["volume_ok"],
+        "last_bar (UK)": latest["last_bar"],
+        "active_since (filtered)": latest["active_since_filtered"],
+        "active_since (raw)": latest["active_since_raw"],
         "price_binance": latest["price_binance"],
         "price_coingecko": latest["price_coingecko"],
         "diff_bps": latest["price_diff_bps"],
@@ -256,14 +300,10 @@ st.dataframe(pd.DataFrame(rows), use_container_width=True)
 # Per-symbol panels
 # ==============================
 left, right = st.columns(2)
-for i, (latest, feats, hist, last_sig_val) in enumerate(results):
+for i, (latest, feats, hist_filt, hist_raw) in enumerate(results):
     with (left if i % 2 == 0 else right):
-        st.markdown(f"### {latest['symbol']} — Now: **{latest['signal']}**")
-        if show_provisional:
-            preview = "LONG" if last_sig_val > 0 else ("SHORT" if last_sig_val < 0 else "FLAT")
-            st.caption(f"Provisional (forming candle): **{preview}** — may change on close")
-
-        st.caption(f"Active since: **{latest['timestamp']}**  •  Last bar: **{feats.index[-1].strftime('%Y-%m-%d %I:%M %p %Z')}**")
+        st.markdown(f"### {latest['symbol']} — Filtered: **{latest['signal_filtered']}** • Raw: **{latest['signal_raw']}**")
+        st.caption(f"Trend: {latest['trend']} • Volume OK: {latest['volume_ok']} • Last bar: {latest['last_bar']}")
 
         # ---- PRICE CHART: Close + EMA9 + EMA21 (Altair) ----
         if not feats.empty:
@@ -300,8 +340,14 @@ for i, (latest, feats, hist, last_sig_val) in enumerate(results):
             # RSI bar chart
             st.bar_chart(feats[["rsi14"]])
 
-        # Recent signals table (raw)
-        if not hist.empty:
-            st.markdown("**Recent non-zero signals (raw)**")
-            st.dataframe(hist.sort_values("time", ascending=False).reset_index(drop=True),
+        # Filtered recent signals (UK 12h)
+        if hist_filt is not None and not hist_filt.empty:
+            st.markdown("**Recent non-zero signals (filtered)**")
+            st.dataframe(hist_filt.sort_values("time", ascending=False).reset_index(drop=True),
+                         use_container_width=True, height=240)
+
+        # Raw recent signals (optional)
+        if show_raw_table and hist_raw is not None and not hist_raw.empty:
+            st.markdown("**Recent non-zero signals (raw, unfiltered)**")
+            st.dataframe(hist_raw.sort_values("time", ascending=False).reset_index(drop=True),
                          use_container_width=True, height=240)
